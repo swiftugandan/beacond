@@ -18,6 +18,22 @@ const FEATURES_PER_BAND: usize = 3;
 /// Total signature vector length for the spectral backend.
 pub const SIGNATURE_LEN: usize = NUM_BANDS * FEATURES_PER_BAND;
 
+/// Similarity threshold for spectral (192-dim) signatures.
+pub const SPECTRAL_THRESHOLD: f64 = 0.6;
+
+/// Similarity threshold for learned (ML) embeddings.
+pub const LEARNED_THRESHOLD: f64 = 0.75;
+
+/// L2-normalize a vector in place so cosine similarity = dot product.
+pub fn l2_normalize(vector: &mut [f32]) {
+    let norm = vector.iter().map(|&x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for v in vector {
+            *v /= norm;
+        }
+    }
+}
+
 /// A sound signature vector (spectral or learned embedding).
 #[derive(Debug, Clone)]
 pub struct Signature {
@@ -104,12 +120,7 @@ impl Signature {
         }
 
         // L2-normalize so cosine similarity = dot product.
-        let norm = vector.iter().map(|&x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for v in &mut vector {
-                *v /= norm;
-            }
-        }
+        l2_normalize(&mut vector);
 
         Signature { vector }
     }
@@ -138,7 +149,7 @@ impl Signature {
     /// Deserialize from bytes (SQLite blob).
     /// Accepts any length that is a multiple of 4 bytes (variable-dim embeddings).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() % 4 != 0 || bytes.is_empty() {
+        if !bytes.len().is_multiple_of(4) || bytes.is_empty() {
             return None;
         }
         let vector: Vec<f32> = bytes
@@ -151,6 +162,15 @@ impl Signature {
     /// Returns the dimensionality of this signature.
     pub fn dim(&self) -> usize {
         self.vector.len()
+    }
+
+    /// Returns the appropriate similarity threshold for this signature type.
+    pub fn similarity_threshold(&self) -> f64 {
+        if self.vector.len() == SIGNATURE_LEN {
+            SPECTRAL_THRESHOLD
+        } else {
+            LEARNED_THRESHOLD
+        }
     }
 }
 

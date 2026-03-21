@@ -152,6 +152,43 @@ struct DaemonState {
     embedder: Option<crate::embeddings::AudioEmbedder>,
 }
 
+/// Compute a signature from audio, using ML embeddings if available, falling back to spectral.
+/// The spectrogram is only computed if needed (no embedder, or embedding fails).
+fn compute_signature(
+    state: &DaemonState,
+    samples: &[f32],
+    sample_rate: u32,
+) -> (crate::signature::Signature, crate::spectrogram::Spectrogram) {
+    #[cfg(feature = "ml-embeddings")]
+    if let Some(ref embedder) = state.embedder {
+        match embedder.embed(samples, sample_rate) {
+            Ok(vec) => {
+                // Spectrogram still needed for fingerprinting, compute it.
+                let spectrogram = crate::spectrogram::Spectrogram::compute(
+                    samples,
+                    sample_rate,
+                    &state.fingerprinter.config.spectrogram,
+                );
+                return (
+                    crate::signature::Signature::from_embedding(vec),
+                    spectrogram,
+                );
+            }
+            Err(e) => {
+                log::warn!("Embedding failed, falling back to spectral: {}", e);
+            }
+        }
+    }
+
+    let spectrogram = crate::spectrogram::Spectrogram::compute(
+        samples,
+        sample_rate,
+        &state.fingerprinter.config.spectrogram,
+    );
+    let sig = crate::signature::Signature::from_spectrogram(&spectrogram);
+    (sig, spectrogram)
+}
+
 /// Broadcast channel for zone events (separate from mutex-guarded state).
 type EventTx = tokio::sync::broadcast::Sender<ZoneEvent>;
 
@@ -454,27 +491,8 @@ fn process_request(request: DaemonRequest, state: &Arc<Mutex<DaemonState>>) -> D
             match signal {
                 Ok(signal) => {
                     let mut state = state.lock().unwrap();
-                    let spectrogram = crate::spectrogram::Spectrogram::compute(
-                        &signal.samples,
-                        signal.sample_rate,
-                        &state.fingerprinter.config.spectrogram,
-                    );
-
-                    // Use ML embeddings if available, otherwise fall back to spectral.
-                    #[cfg(feature = "ml-embeddings")]
-                    let sig = if let Some(ref embedder) = state.embedder {
-                        match embedder.embed(&signal.samples, signal.sample_rate) {
-                            Ok(vec) => crate::signature::Signature::from_embedding(vec),
-                            Err(e) => {
-                                log::warn!("Embedding failed, falling back to spectral: {}", e);
-                                crate::signature::Signature::from_spectrogram(&spectrogram)
-                            }
-                        }
-                    } else {
-                        crate::signature::Signature::from_spectrogram(&spectrogram)
-                    };
-                    #[cfg(not(feature = "ml-embeddings"))]
-                    let sig = crate::signature::Signature::from_spectrogram(&spectrogram);
+                    let (sig, spectrogram) =
+                        compute_signature(&state, &signal.samples, signal.sample_rate);
 
                     let sig_bytes = sig.to_bytes();
                     let fingerprints = state.fingerprinter.fingerprint_spectrogram(&spectrogram);
@@ -560,51 +578,24 @@ fn process_request(request: DaemonRequest, state: &Arc<Mutex<DaemonState>>) -> D
 
                     let mut best_detection: Option<(String, f64, &str)> = None;
 
-                    // Vector similarity matching (ML embeddings or spectral).
-                    {
-                        let spectrogram = crate::spectrogram::Spectrogram::compute(
-                            &signal.samples,
-                            signal.sample_rate,
-                            &state.fingerprinter.config.spectrogram,
-                        );
+                    let (query_sig, _spectrogram) =
+                        compute_signature(&state, &signal.samples, signal.sample_rate);
 
-                        #[cfg(feature = "ml-embeddings")]
-                        let query_sig = if let Some(ref embedder) = state.embedder {
-                            match embedder.embed(&signal.samples, signal.sample_rate) {
-                                Ok(vec) => crate::signature::Signature::from_embedding(vec),
-                                Err(e) => {
-                                    log::warn!("Embedding failed in detect, falling back: {}", e);
-                                    crate::signature::Signature::from_spectrogram(&spectrogram)
+                    // Vector similarity matching.
+                    if let Ok(zone_sigs) = state.db.get_zone_signatures() {
+                        let threshold = query_sig.similarity_threshold();
+                        for (zone_name, sig_bytes) in &zone_sigs {
+                            if let Some(stored_sig) =
+                                crate::signature::Signature::from_bytes(sig_bytes)
+                            {
+                                if stored_sig.dim() != query_sig.dim() {
+                                    continue;
                                 }
-                            }
-                        } else {
-                            crate::signature::Signature::from_spectrogram(&spectrogram)
-                        };
-                        #[cfg(not(feature = "ml-embeddings"))]
-                        let query_sig =
-                            crate::signature::Signature::from_spectrogram(&spectrogram);
-
-                        if let Ok(zone_sigs) = state.db.get_zone_signatures() {
-                            for (zone_name, sig_bytes) in &zone_sigs {
-                                if let Some(stored_sig) =
-                                    crate::signature::Signature::from_bytes(sig_bytes)
+                                let sim = query_sig.similarity(&stored_sig) as f64;
+                                if sim > threshold
+                                    && best_detection.as_ref().is_none_or(|(_, c, _)| sim > *c)
                                 {
-                                    if stored_sig.dim() != query_sig.dim() {
-                                        continue;
-                                    }
-                                    let sim = query_sig.similarity(&stored_sig) as f64;
-                                    let threshold =
-                                        if query_sig.dim() == crate::signature::SIGNATURE_LEN {
-                                            0.6
-                                        } else {
-                                            0.75
-                                        };
-                                    if sim > threshold
-                                        && best_detection.as_ref().is_none_or(|(_, c, _)| sim > *c)
-                                    {
-                                        best_detection =
-                                            Some((zone_name.clone(), sim, "signature"));
-                                    }
+                                    best_detection = Some((zone_name.clone(), sim, "signature"));
                                 }
                             }
                         }
@@ -737,31 +728,10 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
 
             match signal {
                 Ok(Ok(signal)) => {
-                    // Compute spectrogram once, share between signature and fingerprinting.
                     let (query_sig, fingerprints) = {
                         let state = state.lock().unwrap();
-                        let spectrogram = crate::spectrogram::Spectrogram::compute(
-                            &signal.samples,
-                            signal.sample_rate,
-                            &state.fingerprinter.config.spectrogram,
-                        );
-
-                        // Use ML embeddings if available, otherwise spectral.
-                        #[cfg(feature = "ml-embeddings")]
-                        let sig = if let Some(ref embedder) = state.embedder {
-                            match embedder.embed(&signal.samples, signal.sample_rate) {
-                                Ok(vec) => crate::signature::Signature::from_embedding(vec),
-                                Err(e) => {
-                                    log::warn!("Embedding failed in monitor, falling back: {}", e);
-                                    crate::signature::Signature::from_spectrogram(&spectrogram)
-                                }
-                            }
-                        } else {
-                            crate::signature::Signature::from_spectrogram(&spectrogram)
-                        };
-                        #[cfg(not(feature = "ml-embeddings"))]
-                        let sig = crate::signature::Signature::from_spectrogram(&spectrogram);
-
+                        let (sig, spectrogram) =
+                            compute_signature(&state, &signal.samples, signal.sample_rate);
                         let fps = state.fingerprinter.fingerprint_spectrogram(&spectrogram);
                         (sig, fps)
                     };
@@ -770,22 +740,15 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
                     {
                         let state = state.lock().unwrap();
                         if let Ok(zone_sigs) = state.db.get_zone_signatures() {
+                            let threshold = query_sig.similarity_threshold();
                             for (zone_name, sig_bytes) in &zone_sigs {
                                 if let Some(stored_sig) =
                                     crate::signature::Signature::from_bytes(sig_bytes)
                                 {
-                                    // Skip dimension-mismatched signatures (e.g., spectral vs learned).
                                     if stored_sig.dim() != query_sig.dim() {
                                         continue;
                                     }
                                     let sim = query_sig.similarity(&stored_sig) as f64;
-                                    // Learned embeddings need a higher threshold than spectral.
-                                    let threshold =
-                                        if query_sig.dim() == crate::signature::SIGNATURE_LEN {
-                                            0.6
-                                        } else {
-                                            0.75
-                                        };
                                     if sim > threshold
                                         && best_detection.as_ref().is_none_or(|(_, c)| sim > *c)
                                     {

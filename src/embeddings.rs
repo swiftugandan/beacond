@@ -58,13 +58,9 @@ impl AudioEmbedder {
             .and_then(|outlet| match outlet.dtype() {
                 ort::value::ValueType::Tensor { shape, .. } => {
                     // Take the last dimension as embedding dim.
-                    shape.last().and_then(|&d| {
-                        if d > 0 {
-                            Some(d as usize)
-                        } else {
-                            None
-                        }
-                    })
+                    shape
+                        .last()
+                        .and_then(|&d| if d > 0 { Some(d as usize) } else { None })
                 }
                 _ => None,
             })
@@ -101,17 +97,19 @@ impl AudioEmbedder {
         // Zero-pad to a multiple of 160 samples (10ms frames at 16kHz).
         // Many audio models internally reshape into fixed-size frames.
         const FRAME_ALIGN: usize = 160;
-        let mut padded = input_samples.to_vec();
-        let remainder = padded.len() % FRAME_ALIGN;
-        if remainder != 0 {
-            padded.resize(padded.len() + FRAME_ALIGN - remainder, 0.0);
-        }
+        let remainder = input_samples.len() % FRAME_ALIGN;
+        let padded = if remainder != 0 {
+            let mut v = input_samples.to_vec();
+            v.resize(v.len() + FRAME_ALIGN - remainder, 0.0);
+            v
+        } else {
+            input_samples.to_vec()
+        };
 
         // Build input tensor: [1, num_samples].
         let input_len = padded.len();
-        let input_array =
-            ndarray::Array2::from_shape_vec((1, input_len), padded)
-                .context("Failed to create input tensor")?;
+        let input_array = ndarray::Array2::from_shape_vec((1, input_len), padded)
+            .context("Failed to create input tensor")?;
 
         // Create a Tensor from the ndarray, then run inference.
         let input_tensor = ort::value::Tensor::from_array(input_array)
@@ -155,12 +153,7 @@ impl AudioEmbedder {
         };
 
         // L2-normalize.
-        let norm = embedding.iter().map(|&x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 {
-            for v in &mut embedding {
-                *v /= norm;
-            }
-        }
+        crate::signature::l2_normalize(&mut embedding);
 
         Ok(embedding)
     }
