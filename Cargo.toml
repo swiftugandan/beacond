@@ -1,0 +1,29 @@
+[package]
+name = "beacon"
+version = "0.1.0"
+edition = "2021"
+description = "Audio-based spatial awareness toolkit"
+license = "MIT"
+
+[[bin]]
+name = "beacond"
+path = "src/main.rs"
+
+[dependencies]
+hound = "3.5"
+rustfft = "6.2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+colored = "2"
+indicatif = "0.17"
+chrono = "0.4"
+anyhow = "1"
+thiserror = "1"
+byteorder = "1"
+cpal = "0.15"
