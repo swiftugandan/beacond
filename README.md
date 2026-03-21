@@ -12,7 +12,7 @@ Define zones by their ambient sound signature or with ultrasonic beacons, detect
 
 Beacon uses two complementary matching strategies to identify zones. Each zone is defined either by recording its ambient sound (HVAC hum, electrical noise, room resonance) or by a unique ultrasonic beacon WAV emitted from a speaker.
 
-**Hash-based fingerprinting** (inspired by [Shazam's algorithm](https://www.ee.columbia.edu/~dpwe/papers/Wang03-shazam.pdf)) provides precise matching for distinctive audio signatures. **Vector similarity matching** computes a fixed-length spectral envelope (192-dimensional) that captures the overall "character" of a room's sound using cosine similarity. During detection, both methods run in parallel and the best match wins.
+**Hash-based fingerprinting** (inspired by [Shazam's algorithm](https://www.ee.columbia.edu/~dpwe/papers/Wang03-shazam.pdf)) provides precise matching for distinctive audio signatures. **Vector similarity matching** computes a fixed-length feature vector that captures the overall "character" of a room's sound using cosine similarity. Two signature backends are available: a built-in 192-dimensional spectral envelope, and an optional ML-powered backend that runs a pre-trained audio embedding model (e.g., YAMNet — 1024 dimensions) via ONNX Runtime for dramatically better noise robustness. During detection, both fingerprint and signature methods run in parallel and the best match wins.
 
 ```
   Audio Input (WAV or Mic)
@@ -23,21 +23,22 @@ Beacon uses two complementary matching strategies to identify zones. Each zone i
 │  Resample   │     │  Spectrogram │──────┐                                   │
 │  + Filter   │     │  (1024-pt)   │      │                                   │
 └─────────────┘     └──────────────┘      │                                   │
-                                          ▼                                   ▼
-                                  ┌───────────────┐                  ┌────────────────┐
-                                  │ Constellation  │                  │   Signature    │
-                                  │ Peak Extraction│                  │   (64-band     │
-                                  │ + Combinatorial│                  │   spectral     │
-                                  │ Hashing        │                  │   envelope)    │
-                                  └───────┬───────┘                  └───────┬────────┘
-                                          │                                  │
-                                          ▼                                  ▼
-                                  ┌──────────────┐                  ┌────────────────┐
-                                  │  SQLite DB   │                  │  Cosine        │
-                                  │  (hash →     │                  │  Similarity    │
-                                  │   zone +     │                  │  vs stored     │
-                                  │   offset)    │                  │  signatures    │
-                                  └──────────────┘                  └────────────────┘
+                         │                ▼                                   ▼
+                         │        ┌───────────────┐                  ┌────────────────┐
+                         │        │ Constellation  │                  │   Signature    │
+                         │        │ Peak Extraction│                  │   (spectral    │
+                         │        │ + Combinatorial│                  │   envelope OR  │
+                         │        │ Hashing        │                  │   ML embedding)│
+                         │        └───────┬───────┘                  └───────┬────────┘
+                         │                │                                  │
+              ┌──────────┘                ▼                                  ▼
+              │  (if ML)         ┌──────────────┐                  ┌────────────────┐
+              ▼                  │  SQLite DB   │                  │  Cosine        │
+     ┌──────────────┐            │  (hash →     │                  │  Similarity    │
+     │ ONNX Model   │            │   zone +     │                  │  vs stored     │
+     │ (e.g. YAMNet)│────────────│   offset)    │                  │  signatures    │
+     │ 1024-dim emb │            └──────────────┘                  └────────────────┘
+     └──────────────┘
 ```
 
 1. **Decode & Resample** — Read WAV audio, mix to mono, resample to the target rate for the frequency mode (16 kHz audible, 96 kHz ultrasonic/full).
@@ -45,8 +46,10 @@ Beacon uses two complementary matching strategies to identify zones. Each zone i
 3. **Spectrogram** — 1024-sample Hann-windowed STFT with 512-sample hop via `rustfft`.
 4. **Constellation Map** — Extract spectral peaks across 6 frequency bands with local maximum detection.
 5. **Combinatorial Hashing** — Pair nearby peaks into 64-bit xxHash fingerprints.
-6. **Signature** — Compute a 192-dimensional (64 bands x 3 features: log mean energy, log variance, peak ratio) L2-normalized spectral envelope vector.
-7. **Matching** — Hash-based: query hashes are looked up in SQLite, offset histogram alignment identifies the zone. Signature-based: cosine similarity against stored zone signatures (threshold 0.6).
+6. **Signature** — Compute an L2-normalized feature vector for the audio. Two backends:
+   - **Spectral** (default, no extra deps): 192-dimensional vector (64 bands x 3 features: log mean energy, log variance, peak ratio).
+   - **ML embedding** (with `--features ml-embeddings`): runs a pre-trained ONNX audio model (e.g., YAMNet) to produce a 1024-dimensional embedding that is far more robust to noise and environmental variation.
+7. **Matching** — Hash-based: query hashes are looked up in SQLite, offset histogram alignment identifies the zone. Signature-based: cosine similarity against stored zone signatures (threshold 0.6 for spectral, 0.75 for ML embeddings). Both methods run in parallel; the best result wins.
 
 ---
 
@@ -62,6 +65,28 @@ cargo build --release
 cargo install --path .
 ```
 
+#### With ML embeddings (optional)
+
+```bash
+# Install ONNX Runtime
+brew install onnxruntime        # macOS
+# or: apt install libonnxruntime-dev  # Debian/Ubuntu
+
+# Build with ML support
+cargo build --release --features ml-embeddings
+
+# Set the ONNX Runtime library path
+export ORT_DYLIB_PATH=/usr/local/lib/libonnxruntime.dylib  # macOS
+# or: export ORT_DYLIB_PATH=/usr/lib/libonnxruntime.so     # Linux
+
+# Run with a model (e.g., YAMNet for 1024-dim audio embeddings)
+beacond daemon --monitor --model-path models/yamnet_embedder.onnx
+```
+
+Without `--model-path` or without the feature, Beacon falls back to the built-in 192-dim spectral signatures — no ONNX Runtime needed.
+
+For a complete walkthrough on obtaining, converting, and running an ML model, see [MODEL_GUIDE.md](MODEL_GUIDE.md).
+
 ### Requirements
 
 - **Rust 1.70+** (stable)
@@ -69,6 +94,7 @@ cargo install --path .
 - **macOS / Windows**: No extra system dependencies
 - SQLite is bundled via `rusqlite[bundled]`
 - Beacon WAV files must be **WAV format** (`.wav`)
+- **ML embeddings** (optional): ONNX Runtime shared library + an ONNX audio embedding model
 
 ---
 
@@ -192,10 +218,11 @@ Commands:
   spectrogram   Launch real-time spectrogram visualizer in the browser
 
 Global Options:
-  --port <PORT>     Daemon port [default: 18923]
-  --bind <ADDR>     Bind address [default: 127.0.0.1]
-  --db <DB>         Database path [default: ~/.beacond/beacond.db]
-  -v, --verbose     Verbose logging
+  --port <PORT>           Daemon port [default: 18923]
+  --bind <ADDR>           Bind address [default: 127.0.0.1]
+  --db <DB>               Database path [default: ~/.beacond/beacond.db]
+  --model-path <PATH>     ONNX audio embedding model (enables ML signatures)
+  -v, --verbose           Verbose logging
 ```
 
 ### Frequency Modes
@@ -278,7 +305,8 @@ src/
 ├── audio.rs              # WAV decoding, resampling, Butterworth biquad filters, tone generation
 ├── spectrogram.rs        # FFT-based spectrogram (Hann window, configurable size/hop)
 ├── fingerprint.rs        # Constellation peak finding + combinatorial hashing (xxh3)
-├── signature.rs          # Ambient sound signatures: 192-dim spectral envelope + cosine similarity
+├── signature.rs          # Sound signatures: variable-dim vectors + cosine similarity
+├── embeddings.rs         # [ml-embeddings] ONNX audio embedding model (YAMNet, OpenL3, etc.)
 ├── database.rs           # SQLite storage, offset-histogram search, zone management
 ├── daemon.rs             # TCP daemon, JSON protocol, monitor loop, event broadcast
 ├── microphone.rs         # Live mic capture via CPAL, sample rate negotiation
@@ -302,6 +330,8 @@ src/
 | `colored` / `indicatif` | CLI colors and progress bars |
 | `chrono` | Timestamps for zone events |
 | `byteorder` | Binary serialization for signature vectors |
+| `ort` | (optional) ONNX Runtime bindings for ML audio embeddings |
+| `ndarray` | (optional) N-dimensional array for model I/O |
 
 ---
 
@@ -330,7 +360,9 @@ src/
 
 Local maximum detection uses a neighbourhood of 5 frames x 5 bins on each side.
 
-### Signature parameters (`signature.rs`)
+### Signature parameters
+
+**Spectral backend** (`signature.rs`):
 
 | Parameter | Default | Effect |
 |-----------|---------|--------|
@@ -339,20 +371,31 @@ Local maximum detection uses a neighbourhood of 5 frames x 5 bins on each side.
 | Vector length | 192 | Total signature dimensions (64 x 3) |
 | Similarity threshold | 0.6 | Minimum cosine similarity for a zone match |
 
+**ML embedding backend** (`embeddings.rs`, requires `--features ml-embeddings`):
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| Model sample rate | 16 kHz | Audio is resampled to this rate before inference |
+| Vector length | model-dependent | 1024 for YAMNet, 512 for OpenL3 |
+| Similarity threshold | 0.75 | Higher threshold for learned embeddings |
+| Frame alignment | 160 samples | Input zero-padded to this boundary |
+
 ### Matching thresholds
 
 | Parameter | Value | Location |
 |-----------|-------|----------|
 | Min hash hits for match | 5 | `database.rs` — offset histogram peak minimum |
 | Min confidence (monitor) | 0.05 | `daemon.rs` — hash-based monitor loop |
-| Min similarity (monitor) | 0.6 | `daemon.rs` — signature-based monitor loop |
+| Min similarity (spectral) | 0.6 | `daemon.rs` — spectral signature matching |
+| Min similarity (ML) | 0.75 | `daemon.rs` — learned embedding matching |
 
 ---
 
 ## Running Tests
 
 ```bash
-cargo test
+cargo test                              # Base tests (no ONNX Runtime needed)
+cargo test --features ml-embeddings     # Include embedding module tests
 ```
 
 ---

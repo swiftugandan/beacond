@@ -10,6 +10,8 @@ pub mod audio;
 pub mod cli;
 pub mod daemon;
 pub mod database;
+#[cfg(feature = "ml-embeddings")]
+pub mod embeddings;
 pub mod fingerprint;
 pub mod microphone;
 pub mod signature;

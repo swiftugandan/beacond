@@ -53,6 +53,12 @@ pub struct Cli {
     /// Verbose logging
     #[arg(short, long, global = true)]
     pub verbose: bool,
+
+    /// Path to an ONNX audio embedding model for ML-powered zone signatures.
+    /// When provided (and built with --features ml-embeddings), replaces the
+    /// default spectral signatures with learned embeddings.
+    #[arg(long, global = true)]
+    pub model_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -258,6 +264,8 @@ pub async fn execute() -> Result<()> {
     let port = cli.port;
     let bind = cli.bind.clone();
 
+    let model_path = cli.model_path.clone();
+
     match cli.command {
         Command::Daemon {
             foreground: _,
@@ -275,8 +283,11 @@ pub async fn execute() -> Result<()> {
             if monitor {
                 println!("  {} enabled", "Monitor:".dimmed());
             }
+            if let Some(ref mp) = model_path {
+                println!("  {} {}", "Model:".dimmed(), mp.display());
+            }
             println!("{}", "━".repeat(50).dimmed());
-            daemon::run_daemon(&db_path, port, &bind, monitor).await
+            daemon::run_daemon(&db_path, port, &bind, monitor, model_path.as_deref()).await
         }
 
         Command::Ingest {

@@ -15,13 +15,15 @@ const NUM_BANDS: usize = 64;
 /// Features per band: mean, variance, peak ratio.
 const FEATURES_PER_BAND: usize = 3;
 
-/// Total signature vector length.
+/// Total signature vector length for the spectral backend.
 pub const SIGNATURE_LEN: usize = NUM_BANDS * FEATURES_PER_BAND;
 
-/// A fixed-length ambient sound signature vector.
+/// A sound signature vector (spectral or learned embedding).
 #[derive(Debug, Clone)]
 pub struct Signature {
-    /// The feature vector (length = SIGNATURE_LEN).
+    /// The feature vector — L2-normalized.
+    /// Length is `SIGNATURE_LEN` (192) for spectral signatures or model-dependent
+    /// for learned embeddings.
     pub vector: Vec<f32>,
 }
 
@@ -122,14 +124,21 @@ impl Signature {
             .sum()
     }
 
+    /// Create a signature from a pre-computed embedding vector (e.g., from an ONNX model).
+    /// The vector must already be L2-normalized.
+    pub fn from_embedding(vector: Vec<f32>) -> Self {
+        Signature { vector }
+    }
+
     /// Serialize the vector to bytes for SQLite blob storage.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.vector.iter().flat_map(|&f| f.to_le_bytes()).collect()
     }
 
     /// Deserialize from bytes (SQLite blob).
+    /// Accepts any length that is a multiple of 4 bytes (variable-dim embeddings).
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != SIGNATURE_LEN * 4 {
+        if bytes.len() % 4 != 0 || bytes.is_empty() {
             return None;
         }
         let vector: Vec<f32> = bytes
@@ -137,6 +146,11 @@ impl Signature {
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
         Some(Signature { vector })
+    }
+
+    /// Returns the dimensionality of this signature.
+    pub fn dim(&self) -> usize {
+        self.vector.len()
     }
 }
 

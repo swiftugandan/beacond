@@ -108,6 +108,9 @@ impl Database {
         let _ = self
             .conn
             .execute_batch("ALTER TABLE zones ADD COLUMN signature BLOB;");
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE zones ADD COLUMN signature_dim INTEGER NOT NULL DEFAULT 192;",
+        );
 
         Ok(())
     }
@@ -316,10 +319,11 @@ impl Database {
         frequency_mode: &str,
         signature: Option<&[u8]>,
     ) -> Result<i64> {
+        let sig_dim = signature.map(|s| s.len() / 4).unwrap_or(0) as i64;
         self.conn
             .execute(
-                "INSERT INTO zones (name, track_id, frequency_mode, signature) VALUES (?1, ?2, ?3, ?4)",
-                params![name, track_id, frequency_mode, signature],
+                "INSERT INTO zones (name, track_id, frequency_mode, signature, signature_dim) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![name, track_id, frequency_mode, signature, sig_dim],
             )
             .with_context(|| format!("Failed to insert zone '{}' (duplicate name?)", name))?;
         Ok(self.conn.last_insert_rowid())

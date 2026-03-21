@@ -147,19 +147,43 @@ pub struct ZoneEvent {
 struct DaemonState {
     db: Database,
     fingerprinter: Fingerprinter,
+    /// Optional ML embedding model for learned audio signatures.
+    #[cfg(feature = "ml-embeddings")]
+    embedder: Option<crate::embeddings::AudioEmbedder>,
 }
 
 /// Broadcast channel for zone events (separate from mutex-guarded state).
 type EventTx = tokio::sync::broadcast::Sender<ZoneEvent>;
 
 /// Run the daemon server.
-pub async fn run_daemon(db_path: &Path, port: u16, bind: &str, monitor: bool) -> Result<()> {
+pub async fn run_daemon(
+    db_path: &Path,
+    port: u16,
+    bind: &str,
+    monitor: bool,
+    _model_path: Option<&Path>,
+) -> Result<()> {
     let db = Database::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
+
+    #[cfg(feature = "ml-embeddings")]
+    let embedder = _model_path
+        .map(|p| {
+            crate::embeddings::AudioEmbedder::load(p)
+                .with_context(|| format!("Failed to load embedding model from {}", p.display()))
+        })
+        .transpose()?;
+
+    #[cfg(feature = "ml-embeddings")]
+    if embedder.is_some() {
+        log::info!("ML embedding model loaded — using learned signatures");
+    }
 
     let state = Arc::new(Mutex::new(DaemonState {
         db,
         fingerprinter: Fingerprinter::with_defaults(),
+        #[cfg(feature = "ml-embeddings")]
+        embedder,
     }));
 
     let (event_tx, _) = tokio::sync::broadcast::channel::<ZoneEvent>(64);
@@ -435,7 +459,23 @@ fn process_request(request: DaemonRequest, state: &Arc<Mutex<DaemonState>>) -> D
                         signal.sample_rate,
                         &state.fingerprinter.config.spectrogram,
                     );
+
+                    // Use ML embeddings if available, otherwise fall back to spectral.
+                    #[cfg(feature = "ml-embeddings")]
+                    let sig = if let Some(ref embedder) = state.embedder {
+                        match embedder.embed(&signal.samples, signal.sample_rate) {
+                            Ok(vec) => crate::signature::Signature::from_embedding(vec),
+                            Err(e) => {
+                                log::warn!("Embedding failed, falling back to spectral: {}", e);
+                                crate::signature::Signature::from_spectrogram(&spectrogram)
+                            }
+                        }
+                    } else {
+                        crate::signature::Signature::from_spectrogram(&spectrogram)
+                    };
+                    #[cfg(not(feature = "ml-embeddings"))]
                     let sig = crate::signature::Signature::from_spectrogram(&spectrogram);
+
                     let sig_bytes = sig.to_bytes();
                     let fingerprints = state.fingerprinter.fingerprint_spectrogram(&spectrogram);
 
@@ -517,37 +557,100 @@ fn process_request(request: DaemonRequest, state: &Arc<Mutex<DaemonState>>) -> D
             match AudioSignal::from_wav_with_mode(&path, mode) {
                 Ok(signal) => {
                     let state = state.lock().unwrap();
+
+                    let mut best_detection: Option<(String, f64, &str)> = None;
+
+                    // Vector similarity matching (ML embeddings or spectral).
+                    {
+                        let spectrogram = crate::spectrogram::Spectrogram::compute(
+                            &signal.samples,
+                            signal.sample_rate,
+                            &state.fingerprinter.config.spectrogram,
+                        );
+
+                        #[cfg(feature = "ml-embeddings")]
+                        let query_sig = if let Some(ref embedder) = state.embedder {
+                            match embedder.embed(&signal.samples, signal.sample_rate) {
+                                Ok(vec) => crate::signature::Signature::from_embedding(vec),
+                                Err(e) => {
+                                    log::warn!("Embedding failed in detect, falling back: {}", e);
+                                    crate::signature::Signature::from_spectrogram(&spectrogram)
+                                }
+                            }
+                        } else {
+                            crate::signature::Signature::from_spectrogram(&spectrogram)
+                        };
+                        #[cfg(not(feature = "ml-embeddings"))]
+                        let query_sig =
+                            crate::signature::Signature::from_spectrogram(&spectrogram);
+
+                        if let Ok(zone_sigs) = state.db.get_zone_signatures() {
+                            for (zone_name, sig_bytes) in &zone_sigs {
+                                if let Some(stored_sig) =
+                                    crate::signature::Signature::from_bytes(sig_bytes)
+                                {
+                                    if stored_sig.dim() != query_sig.dim() {
+                                        continue;
+                                    }
+                                    let sim = query_sig.similarity(&stored_sig) as f64;
+                                    let threshold =
+                                        if query_sig.dim() == crate::signature::SIGNATURE_LEN {
+                                            0.6
+                                        } else {
+                                            0.75
+                                        };
+                                    if sim > threshold
+                                        && best_detection.as_ref().is_none_or(|(_, c, _)| sim > *c)
+                                    {
+                                        best_detection =
+                                            Some((zone_name.clone(), sim, "signature"));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Hash-based fingerprint matching.
                     let fingerprints = state
                         .fingerprinter
                         .fingerprint(&signal.samples, signal.sample_rate);
 
-                    if fingerprints.is_empty() {
-                        return DaemonResponse::error("No fingerprints extracted from audio");
-                    }
-
-                    match state.db.search(&fingerprints, 3, mode.sample_rate()) {
-                        Ok(results) if !results.is_empty() => {
-                            let top = &results[0];
-                            match state.db.get_zone_by_track_id(top.track.id) {
-                                Ok(Some(zone)) => DaemonResponse::ok_with_data(
-                                    format!("Zone detected: {}", zone.name),
-                                    serde_json::json!({
-                                        "zone": zone.name,
-                                        "confidence": top.confidence,
-                                        "match_count": top.match_count,
-                                    }),
-                                ),
-                                _ => DaemonResponse::ok_with_data(
-                                    "No zone detected",
-                                    serde_json::json!({ "zone": null }),
-                                ),
+                    if !fingerprints.is_empty() {
+                        if let Ok(results) = state.db.search(&fingerprints, 3, mode.sample_rate()) {
+                            if let Some(top) = results.first() {
+                                if top.confidence >= 0.05 {
+                                    if let Ok(Some(zone)) =
+                                        state.db.get_zone_by_track_id(top.track.id)
+                                    {
+                                        if best_detection
+                                            .as_ref()
+                                            .is_none_or(|(_, c, _)| top.confidence > *c)
+                                        {
+                                            best_detection = Some((
+                                                zone.name.clone(),
+                                                top.confidence,
+                                                "fingerprint",
+                                            ));
+                                        }
+                                    }
+                                }
                             }
                         }
-                        Ok(_) => DaemonResponse::ok_with_data(
+                    }
+
+                    match best_detection {
+                        Some((zone_name, confidence, method)) => DaemonResponse::ok_with_data(
+                            format!("Zone detected: {}", zone_name),
+                            serde_json::json!({
+                                "zone": zone_name,
+                                "confidence": confidence,
+                                "method": method,
+                            }),
+                        ),
+                        None => DaemonResponse::ok_with_data(
                             "No zone detected",
                             serde_json::json!({ "zone": null }),
                         ),
-                        Err(e) => DaemonResponse::error(format!("Search failed: {}", e)),
                     }
                 }
                 Err(e) => DaemonResponse::error(format!("Failed to read audio: {}", e)),
@@ -642,7 +745,23 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
                             signal.sample_rate,
                             &state.fingerprinter.config.spectrogram,
                         );
+
+                        // Use ML embeddings if available, otherwise spectral.
+                        #[cfg(feature = "ml-embeddings")]
+                        let sig = if let Some(ref embedder) = state.embedder {
+                            match embedder.embed(&signal.samples, signal.sample_rate) {
+                                Ok(vec) => crate::signature::Signature::from_embedding(vec),
+                                Err(e) => {
+                                    log::warn!("Embedding failed in monitor, falling back: {}", e);
+                                    crate::signature::Signature::from_spectrogram(&spectrogram)
+                                }
+                            }
+                        } else {
+                            crate::signature::Signature::from_spectrogram(&spectrogram)
+                        };
+                        #[cfg(not(feature = "ml-embeddings"))]
                         let sig = crate::signature::Signature::from_spectrogram(&spectrogram);
+
                         let fps = state.fingerprinter.fingerprint_spectrogram(&spectrogram);
                         (sig, fps)
                     };
@@ -655,8 +774,19 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
                                 if let Some(stored_sig) =
                                     crate::signature::Signature::from_bytes(sig_bytes)
                                 {
+                                    // Skip dimension-mismatched signatures (e.g., spectral vs learned).
+                                    if stored_sig.dim() != query_sig.dim() {
+                                        continue;
+                                    }
                                     let sim = query_sig.similarity(&stored_sig) as f64;
-                                    if sim > 0.6
+                                    // Learned embeddings need a higher threshold than spectral.
+                                    let threshold =
+                                        if query_sig.dim() == crate::signature::SIGNATURE_LEN {
+                                            0.6
+                                        } else {
+                                            0.75
+                                        };
+                                    if sim > threshold
                                         && best_detection.as_ref().is_none_or(|(_, c)| sim > *c)
                                     {
                                         best_detection = Some((zone_name.clone(), sim));
