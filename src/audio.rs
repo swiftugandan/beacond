@@ -147,15 +147,15 @@ impl AudioSignal {
 
         // Resample to target rate for this mode
         let target_rate = mode.sample_rate();
-        let resampled = resample(&mono_samples, source_rate, target_rate);
+        let mut samples = resample(&mono_samples, source_rate, target_rate);
 
-        // Apply frequency-band filtering
-        let filtered = apply_mode_filter(&resampled, target_rate, mode);
+        // Apply frequency-band filtering in-place
+        apply_mode_filter(&mut samples, target_rate, mode);
 
-        let duration_secs = filtered.len() as f32 / target_rate as f32;
+        let duration_secs = samples.len() as f32 / target_rate as f32;
 
         Ok(AudioSignal {
-            samples: filtered,
+            samples,
             sample_rate: target_rate,
             duration_secs,
             mode,
@@ -174,15 +174,15 @@ impl AudioSignal {
         mode: FrequencyMode,
     ) -> Self {
         let target_rate = mode.sample_rate();
-        let resampled = if sample_rate != target_rate {
+        let mut resampled = if sample_rate != target_rate {
             resample(&samples, sample_rate, target_rate)
         } else {
             samples
         };
-        let filtered = apply_mode_filter(&resampled, target_rate, mode);
-        let duration_secs = filtered.len() as f32 / target_rate as f32;
+        apply_mode_filter(&mut resampled, target_rate, mode);
+        let duration_secs = resampled.len() as f32 / target_rate as f32;
         AudioSignal {
-            samples: filtered,
+            samples: resampled,
             sample_rate: target_rate,
             duration_secs,
             mode,
@@ -191,27 +191,24 @@ impl AudioSignal {
 }
 
 /// Apply the appropriate band-pass filter for the frequency mode.
-fn apply_mode_filter(samples: &[f32], sample_rate: u32, mode: FrequencyMode) -> Vec<f32> {
-    let mut result = samples.to_vec();
-
+/// Filters in-place to avoid redundant allocations.
+fn apply_mode_filter(samples: &mut Vec<f32>, sample_rate: u32, mode: FrequencyMode) {
     // Apply high-pass filter if needed (removes low frequencies)
     if let Some(cutoff) = mode.highpass_cutoff() {
-        result = biquad_highpass(&result, sample_rate, cutoff);
+        biquad_highpass_inplace(samples, sample_rate, cutoff);
         // Apply twice for steeper rolloff (4th-order)
-        result = biquad_highpass(&result, sample_rate, cutoff);
+        biquad_highpass_inplace(samples, sample_rate, cutoff);
     }
 
     // Apply low-pass filter if needed (removes high frequencies)
     if let Some(cutoff) = mode.lowpass_cutoff() {
-        result = biquad_lowpass(&result, sample_rate, cutoff);
-        result = biquad_lowpass(&result, sample_rate, cutoff);
+        biquad_lowpass_inplace(samples, sample_rate, cutoff);
+        biquad_lowpass_inplace(samples, sample_rate, cutoff);
     }
-
-    result
 }
 
-/// 2nd-order Butterworth high-pass filter (biquad implementation).
-fn biquad_highpass(samples: &[f32], sample_rate: u32, cutoff: f32) -> Vec<f32> {
+/// 2nd-order Butterworth high-pass filter (biquad, in-place).
+fn biquad_highpass_inplace(samples: &mut [f32], sample_rate: u32, cutoff: f32) {
     let omega = 2.0 * std::f64::consts::PI * cutoff as f64 / sample_rate as f64;
     let cos_omega = omega.cos();
     let alpha = omega.sin() / (2.0_f64.sqrt()); // Q = 1/√2 for Butterworth
@@ -223,11 +220,11 @@ fn biquad_highpass(samples: &[f32], sample_rate: u32, cutoff: f32) -> Vec<f32> {
     let a1 = -2.0 * cos_omega;
     let a2 = 1.0 - alpha;
 
-    apply_biquad(samples, b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    apply_biquad_inplace(samples, b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
 }
 
-/// 2nd-order Butterworth low-pass filter (biquad implementation).
-fn biquad_lowpass(samples: &[f32], sample_rate: u32, cutoff: f32) -> Vec<f32> {
+/// 2nd-order Butterworth low-pass filter (biquad, in-place).
+fn biquad_lowpass_inplace(samples: &mut [f32], sample_rate: u32, cutoff: f32) {
     let omega = 2.0 * std::f64::consts::PI * cutoff as f64 / sample_rate as f64;
     let cos_omega = omega.cos();
     let alpha = omega.sin() / (2.0_f64.sqrt());
@@ -239,30 +236,27 @@ fn biquad_lowpass(samples: &[f32], sample_rate: u32, cutoff: f32) -> Vec<f32> {
     let a1 = -2.0 * cos_omega;
     let a2 = 1.0 - alpha;
 
-    apply_biquad(samples, b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0)
+    apply_biquad_inplace(samples, b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0);
 }
 
-/// Apply a biquad filter with the given coefficients.
-fn apply_biquad(samples: &[f32], b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) -> Vec<f32> {
-    let mut output = Vec::with_capacity(samples.len());
+/// Apply a biquad filter with the given coefficients, mutating samples in-place.
+fn apply_biquad_inplace(samples: &mut [f32], b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) {
     let mut x1: f64 = 0.0;
     let mut x2: f64 = 0.0;
     let mut y1: f64 = 0.0;
     let mut y2: f64 = 0.0;
 
-    for &sample in samples {
-        let x0 = sample as f64;
+    for sample in samples.iter_mut() {
+        let x0 = *sample as f64;
         let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
 
-        output.push(y0 as f32);
+        *sample = y0 as f32;
 
         x2 = x1;
         x1 = x0;
         y2 = y1;
         y1 = y0;
     }
-
-    output
 }
 
 /// Mix multi-channel audio to mono by averaging channels.

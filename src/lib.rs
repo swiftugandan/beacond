@@ -7,6 +7,7 @@
 //! - Offset histogram alignment for robust matching
 
 pub mod audio;
+pub mod bloom;
 pub mod cli;
 pub mod daemon;
 pub mod database;

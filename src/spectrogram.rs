@@ -132,3 +132,44 @@ impl Spectrogram {
         frame as f32 * self.hop_size as f32 / self.sample_rate as f32
     }
 }
+
+/// Compute a single frame's magnitude spectrum into an output buffer.
+/// This is exposed for sparse peak extraction to avoid storing the full spectrogram.
+pub fn compute_frame_magnitudes(
+    samples: &[f32],
+    frame_idx: usize,
+    hop_size: usize,
+    hann_win: &[f32],
+    fft: &dyn rustfft::Fft<f32>,
+    fft_buffer: &mut [Complex<f32>],
+    out: &mut [f32],
+) {
+    let window_size = hann_win.len();
+    let start = frame_idx * hop_size;
+    let end = (start + window_size).min(samples.len());
+
+    // Fill buffer with windowed samples.
+    for (i, &w) in hann_win[..end - start].iter().enumerate() {
+        fft_buffer[i] = Complex::new(samples[start + i] * w, 0.0);
+    }
+    // Zero-pad if needed.
+    for b in &mut fft_buffer[end - start..] {
+        *b = Complex::new(0.0, 0.0);
+    }
+
+    fft.process(fft_buffer);
+
+    let num_bins = out.len();
+    for (o, c) in out.iter_mut().zip(fft_buffer[..num_bins].iter()) {
+        *o = (c.re * c.re + c.im * c.im).sqrt();
+    }
+}
+
+/// Count how many frames fit in the given number of samples.
+pub fn frame_count(num_samples: usize, window_size: usize, hop_size: usize) -> usize {
+    if num_samples >= window_size {
+        (num_samples - window_size) / hop_size + 1
+    } else {
+        0
+    }
+}

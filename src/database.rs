@@ -1,5 +1,6 @@
 //! SQLite-backed fingerprint database for storage and lookup.
 
+use crate::bloom::BloomFilter;
 use crate::fingerprint::Fingerprint;
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -37,6 +38,8 @@ pub struct MatchResult {
 /// The fingerprint database.
 pub struct Database {
     conn: Connection,
+    /// Bloom filter for fast hash pre-screening in search queries.
+    bloom: Option<BloomFilter>,
 }
 
 impl Database {
@@ -45,15 +48,16 @@ impl Database {
         let conn = Connection::open(path.as_ref())
             .with_context(|| format!("Failed to open database: {}", path.as_ref().display()))?;
 
-        let db = Database { conn };
+        let mut db = Database { conn, bloom: None };
         db.initialize()?;
+        db.rebuild_bloom_filter()?;
         Ok(db)
     }
 
     /// Create an in-memory database (for testing).
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let db = Database { conn };
+        let db = Database { conn, bloom: None };
         db.initialize()?;
         Ok(db)
     }
@@ -112,6 +116,28 @@ impl Database {
         Ok(())
     }
 
+    /// Rebuild the bloom filter from all hashes in the database.
+    fn rebuild_bloom_filter(&mut self) -> Result<()> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM fingerprints", [], |r| r.get(0))?;
+
+        if count == 0 {
+            self.bloom = None;
+            return Ok(());
+        }
+
+        let mut stmt = self.conn.prepare("SELECT DISTINCT hash FROM fingerprints")?;
+        let hashes = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .filter_map(|r| r.ok())
+            .map(|h| h as u64);
+
+        self.bloom = Some(BloomFilter::from_hashes(hashes, count as usize));
+        log::debug!("Rebuilt bloom filter for {} fingerprints", count);
+        Ok(())
+    }
+
     /// Insert a new track with its fingerprints.
     pub fn insert_track(
         &mut self,
@@ -150,6 +176,19 @@ impl Database {
 
         tx.commit()?;
 
+        // Update bloom filter with new hashes
+        if let Some(ref mut bloom) = self.bloom {
+            for fp in fingerprints {
+                bloom.insert(fp.hash);
+            }
+        } else if !fingerprints.is_empty() {
+            let mut bloom = BloomFilter::new(fingerprints.len(), 0.01);
+            for fp in fingerprints {
+                bloom.insert(fp.hash);
+            }
+            self.bloom = Some(bloom);
+        }
+
         log::info!(
             "Inserted track '{}' by '{}' (id={}, {} fingerprints)",
             title,
@@ -170,6 +209,10 @@ impl Database {
         )?;
         let rows = tx.execute("DELETE FROM tracks WHERE id = ?1", params![track_id])?;
         tx.commit()?;
+        if rows > 0 {
+            // Bloom filters don't support deletion, so rebuild
+            self.rebuild_bloom_filter()?;
+        }
         Ok(rows > 0)
     }
 
@@ -216,6 +259,7 @@ impl Database {
 
         // Step 1: Collect all hash matches grouped by track_id.
         // For each match, store (db_offset - query_offset) as the time alignment.
+        // Use the bloom filter to skip hashes that definitely aren't in the DB.
         let mut track_offsets: HashMap<i64, Vec<i64>> = HashMap::new();
 
         let mut stmt = self
@@ -223,6 +267,13 @@ impl Database {
             .prepare("SELECT track_id, offset FROM fingerprints WHERE hash = ?1")?;
 
         for qfp in query_fingerprints {
+            // Bloom filter pre-screening: skip if hash is definitely absent
+            if let Some(ref bloom) = self.bloom {
+                if !bloom.may_contain(qfp.hash) {
+                    continue;
+                }
+            }
+
             let matches = stmt.query_map(params![qfp.hash as i64], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
             })?;
@@ -344,6 +395,7 @@ impl Database {
                 tx.execute("DELETE FROM fingerprints WHERE track_id = ?1", params![tid])?;
                 tx.execute("DELETE FROM tracks WHERE id = ?1", params![tid])?;
                 tx.commit()?;
+                self.rebuild_bloom_filter()?;
                 Ok(true)
             }
             None => Ok(false),
