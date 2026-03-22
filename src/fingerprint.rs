@@ -142,25 +142,26 @@ fn band_boundaries(num_bins: usize, num_bands: usize, log_scale: bool) -> Vec<(u
 
     // Log-spaced: boundaries grow exponentially.
     // Start from bin 1 (skip DC bin 0) to avoid log(0).
+    // Chain boundaries so each band starts where the previous ended (no overlaps or gaps).
     let min_bin = 1.0f32;
     let max_bin = num_bins as f32;
     let log_min = min_bin.ln();
     let log_max = max_bin.ln();
 
     let mut bounds = Vec::with_capacity(num_bands);
+    let mut prev_end = 0usize; // first band starts at bin 0 (includes DC)
     for b in 0..num_bands {
-        let start_f = (log_min + (log_max - log_min) * b as f32 / num_bands as f32).exp();
         let end_f = (log_min + (log_max - log_min) * (b + 1) as f32 / num_bands as f32).exp();
-        let start = (start_f as usize).max(if b == 0 { 0 } else { 1 });
-        let end = (end_f as usize).min(num_bins);
-        // Ensure non-empty bands: merge into previous if empty
-        if start < end {
-            bounds.push((start, end));
-        } else if !bounds.is_empty() {
-            // Extend previous band to cover this range
-            let last = bounds.last_mut().unwrap();
-            last.1 = end.max(last.1);
+        let end = if b == num_bands - 1 {
+            num_bins // last band always reaches the end
+        } else {
+            (end_f as usize).min(num_bins)
+        };
+        // Only add non-empty bands; if empty, next band will cover this range
+        if prev_end < end {
+            bounds.push((prev_end, end));
         }
+        prev_end = end;
     }
     bounds
 }
@@ -311,6 +312,22 @@ impl Fingerprinter {
 
             // center_frame's data is at ring index (center_frame - ring_start)
             let center_idx = center_frame - ring_start;
+
+            // Spectral flatness gating: skip noise-dominated frames (consistent with find_peaks).
+            // Flatness = geo_mean / arith_mean, computed from squared magnitudes.
+            {
+                let frame_mags = &ring[center_idx];
+                let n = frame_mags.len() as f32;
+                let arith_mean = frame_mags.iter().sum::<f32>() / n;
+                if arith_mean > 0.0 {
+                    let log_sum: f32 = frame_mags.iter().map(|&m| (m + 1e-20).ln()).sum();
+                    let geo_mean = (log_sum / n).exp();
+                    let flatness = (geo_mean / arith_mean).clamp(0.0, 1.0);
+                    if flatness > 0.8 {
+                        continue; // skip noise-dominated frame
+                    }
+                }
+            }
 
             for (band_idx, &(bin_start, bin_end)) in bands.iter().enumerate() {
                 let band_threshold = band_thresholds_sq[band_idx];

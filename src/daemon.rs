@@ -734,9 +734,12 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
             *detect_counts.entry(zone_name.clone()).or_insert(0) += 1;
             // Reset counts for all other zones
             detect_counts.retain(|k, _| k == zone_name);
-            // Reset miss counter if we're detecting the current zone
             if current_zone.as_ref() == Some(zone_name) {
+                // Re-detecting the current zone — reset miss counter
                 miss_count = 0;
+            } else if current_zone.is_some() {
+                // Detecting a *different* zone — counts as a miss for the current zone
+                miss_count += 1;
             }
         } else {
             detect_counts.clear();
@@ -766,12 +769,11 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
                 // Transitioning to new zone: require ENTER_COUNT for new zone
                 if detect_counts.get(zone_name).copied().unwrap_or(0) >= ENTER_COUNT {
                     let prev_name = prev.clone();
-                    let exit_now = chrono::Utc::now().to_rfc3339();
                     let _ = event_tx.send(ZoneEvent {
                         event: "zone_exit".to_string(),
                         zone: prev_name.clone(),
                         confidence: None,
-                        timestamp: exit_now,
+                        timestamp: now.clone(),
                     });
                     current_zone = Some(zone_name.clone());
                     miss_count = 0;
