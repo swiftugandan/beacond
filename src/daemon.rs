@@ -624,6 +624,12 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
             continue;
         }
 
+        // Clone fingerprinter config once so we can compute spectrograms without holding the lock.
+        let fingerprinter = {
+            let state = state.lock().unwrap();
+            state.fingerprinter.clone()
+        };
+
         // Record and search in each mode; take the best match across all modes.
         let mut best_detection: Option<(String, f64)> = None;
 
@@ -634,18 +640,14 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
 
             match signal {
                 Ok(Ok(signal)) => {
-                    // Compute spectrogram once, share between signature and fingerprinting.
-                    let (query_sig, fingerprints) = {
-                        let state = state.lock().unwrap();
-                        let spectrogram = crate::spectrogram::Spectrogram::compute(
-                            &signal.samples,
-                            signal.sample_rate,
-                            &state.fingerprinter.config.spectrogram,
-                        );
-                        let sig = crate::signature::Signature::from_spectrogram(&spectrogram);
-                        let fps = state.fingerprinter.fingerprint_spectrogram(&spectrogram);
-                        (sig, fps)
-                    };
+                    // Compute spectrogram outside the lock (uses cloned config).
+                    let spectrogram = crate::spectrogram::Spectrogram::compute(
+                        &signal.samples,
+                        signal.sample_rate,
+                        &fingerprinter.config.spectrogram,
+                    );
+                    let query_sig = crate::signature::Signature::from_spectrogram(&spectrogram);
+                    let fingerprints = fingerprinter.fingerprint_spectrogram(&spectrogram);
 
                     // Vector similarity matching.
                     {

@@ -131,7 +131,9 @@ pub fn record_from_mic(
     );
 
     // Shared buffer for collecting samples from the audio callback
-    let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+    // Pre-allocate buffer for the expected number of mono samples to avoid reallocations.
+    let expected_samples = sample_rate as usize * duration.as_secs() as usize;
+    let buffer: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(expected_samples)));
     let buffer_clone = Arc::clone(&buffer);
     let err_flag: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let err_flag_clone = Arc::clone(&err_flag);

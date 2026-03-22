@@ -11,6 +11,7 @@ use crate::spectrogram::{
 };
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use xxhash_rust::xxh3::xxh3_64;
 
 // ── Peak-finding parameters ──────────────────────────────────────────
@@ -109,6 +110,7 @@ impl FingerprintConfig {
 }
 
 /// The fingerprinting engine.
+#[derive(Clone)]
 pub struct Fingerprinter {
     pub config: FingerprintConfig,
 }
@@ -190,7 +192,7 @@ impl Fingerprinter {
         // Rolling buffer: stores up to (2*PEAK_NEIGHBOURHOOD_TIME + 1) frames.
         // ring_start tracks which absolute frame index ring[0] corresponds to.
         let ring_cap = PEAK_NEIGHBOURHOOD_TIME * 2 + 1;
-        let mut ring: Vec<Vec<f32>> = Vec::with_capacity(ring_cap);
+        let mut ring: VecDeque<Vec<f32>> = VecDeque::with_capacity(ring_cap);
         let mut ring_start: usize = 0; // absolute frame of ring[0]
         let mut peaks: Vec<Peak> = Vec::new();
 
@@ -203,7 +205,7 @@ impl Fingerprinter {
             compute_frame_magnitudes_squared(
                 samples, f, hop_size, &hann_win, fft.as_ref(), &mut fft_buffer, &mut mags,
             );
-            ring.push(mags);
+            ring.push_back(mags);
         }
         // ring now holds frames [0..prefill), ring_start = 0
 
@@ -214,7 +216,7 @@ impl Fingerprinter {
 
             // Evict frames that are before the neighbourhood
             while ring_start < t_start {
-                ring.remove(0);
+                ring.pop_front();
                 ring_start += 1;
             }
 
@@ -225,7 +227,7 @@ impl Fingerprinter {
                 compute_frame_magnitudes_squared(
                     samples, f, hop_size, &hann_win, fft.as_ref(), &mut fft_buffer, &mut mags,
                 );
-                ring.push(mags);
+                ring.push_back(mags);
             }
 
             // center_frame's data is at ring index (center_frame - ring_start)
