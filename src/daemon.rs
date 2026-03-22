@@ -597,14 +597,22 @@ pub async fn is_daemon_running(port: u16) -> bool {
 
 /// Background loop that continuously records from the microphone and emits zone events.
 /// Scans each distinct frequency mode registered across zones.
+/// Hysteresis constants for zone transition debouncing.
+const ENTER_COUNT: usize = 2; // Consecutive detections required to enter a zone
+const EXIT_COUNT: usize = 2; // Consecutive misses required to exit a zone
+
 async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
     use crate::audio::FrequencyMode;
     use crate::microphone;
+    use std::collections::HashMap;
     use std::time::Duration;
 
     let record_duration = Duration::from_secs(3);
     let pause_between = Duration::from_secs(1);
     let mut current_zone: Option<String> = None;
+    // Hysteresis counters: track consecutive detections per zone
+    let mut detect_counts: HashMap<String, usize> = HashMap::new();
+    let mut miss_count: usize = 0; // consecutive cycles with no match for current zone
 
     loop {
         // Determine which frequency modes we need to scan.
@@ -630,8 +638,10 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
             state.fingerprinter.clone()
         };
 
-        // Record and search in each mode; take the best match across all modes.
-        let mut best_detection: Option<(String, f64)> = None;
+        // Record and search in each mode.
+        // Track best signature and hash matches separately for combined scoring.
+        let mut best_sig: Option<(String, f64)> = None;
+        let mut best_hash: Option<(String, f64)> = None;
 
         for mode in modes {
             let dur = record_duration;
@@ -659,9 +669,9 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
                                 {
                                     let sim = query_sig.similarity(&stored_sig) as f64;
                                     if sim > 0.6
-                                        && best_detection.as_ref().is_none_or(|(_, c)| sim > *c)
+                                        && best_sig.as_ref().is_none_or(|(_, c)| sim > *c)
                                     {
-                                        best_detection = Some((zone_name.clone(), sim));
+                                        best_sig = Some((zone_name.clone(), sim));
                                     }
                                 }
                             }
@@ -677,11 +687,11 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
                                     if let Ok(Some(zone)) =
                                         state.db.get_zone_by_track_id(top.track.id)
                                     {
-                                        if best_detection
+                                        if best_hash
                                             .as_ref()
                                             .is_none_or(|(_, c)| top.confidence > *c)
                                         {
-                                            best_detection =
+                                            best_hash =
                                                 Some((zone.name.clone(), top.confidence));
                                         }
                                     }
@@ -699,46 +709,94 @@ async fn monitor_loop(state: Arc<Mutex<DaemonState>>, event_tx: EventTx) {
             }
         }
 
+        // Combined scoring: if both strategies match the same zone, fuse confidence.
+        let best_detection: Option<(String, f64)> = match (&best_sig, &best_hash) {
+            (Some((sig_zone, sig_conf)), Some((hash_zone, hash_conf)))
+                if sig_zone == hash_zone =>
+            {
+                // Both match the same zone — weighted fusion
+                let combined = 0.6 * hash_conf + 0.4 * sig_conf;
+                Some((sig_zone.clone(), combined))
+            }
+            _ => {
+                // Take whichever has higher confidence
+                match (&best_sig, &best_hash) {
+                    (Some((_, sc)), Some((_, hc))) if sc > hc => best_sig,
+                    (_, Some(_)) => best_hash,
+                    (Some(_), None) => best_sig,
+                    _ => None,
+                }
+            }
+        };
+
+        // Update hysteresis counters.
+        if let Some((ref zone_name, _)) = best_detection {
+            *detect_counts.entry(zone_name.clone()).or_insert(0) += 1;
+            // Reset counts for all other zones
+            detect_counts.retain(|k, _| k == zone_name);
+            // Reset miss counter if we're detecting the current zone
+            if current_zone.as_ref() == Some(zone_name) {
+                miss_count = 0;
+            }
+        } else {
+            detect_counts.clear();
+            if current_zone.is_some() {
+                miss_count += 1;
+            }
+        }
+
         let now = chrono::Utc::now().to_rfc3339();
 
         match (&current_zone, &best_detection) {
             (None, Some((zone_name, confidence))) => {
-                current_zone = Some(zone_name.clone());
-                let _ = event_tx.send(ZoneEvent {
-                    event: "zone_enter".to_string(),
-                    zone: zone_name.clone(),
-                    confidence: Some(*confidence),
-                    timestamp: now,
-                });
-                log::info!("Zone enter: {}", zone_name);
+                // Require ENTER_COUNT consecutive detections to enter
+                if detect_counts.get(zone_name).copied().unwrap_or(0) >= ENTER_COUNT {
+                    current_zone = Some(zone_name.clone());
+                    miss_count = 0;
+                    let _ = event_tx.send(ZoneEvent {
+                        event: "zone_enter".to_string(),
+                        zone: zone_name.clone(),
+                        confidence: Some(*confidence),
+                        timestamp: now,
+                    });
+                    log::info!("Zone enter: {} (after {} confirmations)", zone_name, ENTER_COUNT);
+                }
             }
             (Some(prev), Some((zone_name, confidence))) if prev != zone_name => {
-                let prev_name = prev.clone();
-                let exit_now = chrono::Utc::now().to_rfc3339();
-                let _ = event_tx.send(ZoneEvent {
-                    event: "zone_exit".to_string(),
-                    zone: prev_name.clone(),
-                    confidence: None,
-                    timestamp: exit_now,
-                });
-                current_zone = Some(zone_name.clone());
-                let _ = event_tx.send(ZoneEvent {
-                    event: "zone_enter".to_string(),
-                    zone: zone_name.clone(),
-                    confidence: Some(*confidence),
-                    timestamp: now,
-                });
-                log::info!("Zone transition: {} → {}", prev_name, zone_name);
+                // Transitioning to new zone: require ENTER_COUNT for new zone
+                if detect_counts.get(zone_name).copied().unwrap_or(0) >= ENTER_COUNT {
+                    let prev_name = prev.clone();
+                    let exit_now = chrono::Utc::now().to_rfc3339();
+                    let _ = event_tx.send(ZoneEvent {
+                        event: "zone_exit".to_string(),
+                        zone: prev_name.clone(),
+                        confidence: None,
+                        timestamp: exit_now,
+                    });
+                    current_zone = Some(zone_name.clone());
+                    miss_count = 0;
+                    let _ = event_tx.send(ZoneEvent {
+                        event: "zone_enter".to_string(),
+                        zone: zone_name.clone(),
+                        confidence: Some(*confidence),
+                        timestamp: now,
+                    });
+                    log::info!("Zone transition: {} -> {}", prev_name, zone_name);
+                }
             }
             (Some(prev), None) => {
-                let _ = event_tx.send(ZoneEvent {
-                    event: "zone_exit".to_string(),
-                    zone: prev.clone(),
-                    confidence: None,
-                    timestamp: now,
-                });
-                log::info!("Zone exit: {}", prev);
-                current_zone = None;
+                // Require EXIT_COUNT consecutive misses to exit
+                if miss_count >= EXIT_COUNT {
+                    let _ = event_tx.send(ZoneEvent {
+                        event: "zone_exit".to_string(),
+                        zone: prev.clone(),
+                        confidence: None,
+                        timestamp: now,
+                    });
+                    log::info!("Zone exit: {} (after {} misses)", prev, EXIT_COUNT);
+                    current_zone = None;
+                    miss_count = 0;
+                }
             }
             _ => {
                 // Same zone or still no zone — no event

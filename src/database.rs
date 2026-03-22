@@ -294,11 +294,19 @@ impl Database {
                 *histogram.entry(off).or_insert(0) += 1;
             }
 
-            // Find the peak
-            let (best_offset, best_count) = histogram
-                .into_iter()
-                .max_by_key(|&(_, count)| count)
-                .unwrap_or((0, 0));
+            // Find the top two histogram peaks for alignment quality scoring.
+            let mut best_offset = 0i64;
+            let mut best_count = 0usize;
+            let mut second_best_count = 0usize;
+            for (&off, &count) in &histogram {
+                if count > best_count {
+                    second_best_count = best_count;
+                    best_count = count;
+                    best_offset = off;
+                } else if count > second_best_count {
+                    second_best_count = count;
+                }
+            }
 
             // Minimum threshold for a valid match
             if best_count < 5 {
@@ -306,8 +314,19 @@ impl Database {
             }
 
             if let Ok(Some(track)) = self.get_track(*track_id) {
-                // Confidence: ratio of aligned matches to total query fingerprints
-                let confidence = (best_count as f64 / query_fingerprints.len() as f64).min(1.0);
+                // Improved confidence scoring:
+                // Base confidence = ratio of aligned matches to query fingerprints.
+                let base_confidence =
+                    (best_count as f64 / query_fingerprints.len() as f64).min(1.0);
+
+                // Peak-to-second-peak ratio: how much the best alignment stands out.
+                // A sharp histogram peak indicates a true match; a flat histogram
+                // (many offsets with similar counts) suggests random collisions.
+                let peak_ratio =
+                    best_count as f64 / second_best_count.max(1) as f64;
+                let alignment_boost = (peak_ratio / 5.0).min(2.0); // cap at 2×
+
+                let confidence = (base_confidence * alignment_boost).min(1.0);
 
                 // Estimate position in track from offset
                 // offset is in spectrogram frames

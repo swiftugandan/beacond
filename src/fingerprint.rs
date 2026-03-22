@@ -71,10 +71,14 @@ pub struct FingerprintConfig {
     pub num_bands: usize,
     pub max_peaks_per_band: usize,
     pub peak_threshold: f32,
+    /// Use adaptive per-band threshold instead of fixed peak_threshold.
+    pub adaptive_threshold: bool,
     pub target_zone_t_min: usize,
     pub target_zone_t_max: usize,
     pub target_zone_f_range: usize,
     pub max_pairs_per_anchor: usize,
+    /// Use log-spaced frequency bands instead of linear.
+    pub log_frequency_bands: bool,
 }
 
 impl Default for FingerprintConfig {
@@ -84,10 +88,12 @@ impl Default for FingerprintConfig {
             num_bands: NUM_BANDS,
             max_peaks_per_band: MAX_PEAKS_PER_BAND,
             peak_threshold: PEAK_THRESHOLD,
+            adaptive_threshold: true,
             target_zone_t_min: TARGET_ZONE_T_MIN,
             target_zone_t_max: TARGET_ZONE_T_MAX,
             target_zone_f_range: TARGET_ZONE_F_RANGE,
             max_pairs_per_anchor: MAX_PAIRS_PER_ANCHOR,
+            log_frequency_bands: true,
         }
     }
 }
@@ -101,12 +107,62 @@ impl FingerprintConfig {
             num_bands: 4,
             max_peaks_per_band: 2,
             peak_threshold: PEAK_THRESHOLD,
+            adaptive_threshold: true,
             target_zone_t_min: TARGET_ZONE_T_MIN,
             target_zone_t_max: 30,
             target_zone_f_range: TARGET_ZONE_F_RANGE,
             max_pairs_per_anchor: 3,
+            log_frequency_bands: true,
         }
     }
+}
+
+/// Compute frequency band boundaries.
+///
+/// With `log_scale = true`, bands are log-spaced so lower frequencies get narrower
+/// bands (higher resolution) and higher frequencies get wider bands, matching
+/// how acoustic content is distributed. With `log_scale = false`, bands are
+/// equal-width (linear).
+fn band_boundaries(num_bins: usize, num_bands: usize, log_scale: bool) -> Vec<(usize, usize)> {
+    if !log_scale || num_bins <= 1 {
+        // Linear: equal-width bands
+        let band_size = num_bins / num_bands;
+        return (0..num_bands)
+            .map(|b| {
+                let start = b * band_size;
+                let end = if b == num_bands - 1 {
+                    num_bins
+                } else {
+                    (b + 1) * band_size
+                };
+                (start, end)
+            })
+            .collect();
+    }
+
+    // Log-spaced: boundaries grow exponentially.
+    // Start from bin 1 (skip DC bin 0) to avoid log(0).
+    let min_bin = 1.0f32;
+    let max_bin = num_bins as f32;
+    let log_min = min_bin.ln();
+    let log_max = max_bin.ln();
+
+    let mut bounds = Vec::with_capacity(num_bands);
+    for b in 0..num_bands {
+        let start_f = (log_min + (log_max - log_min) * b as f32 / num_bands as f32).exp();
+        let end_f = (log_min + (log_max - log_min) * (b + 1) as f32 / num_bands as f32).exp();
+        let start = (start_f as usize).max(if b == 0 { 0 } else { 1 });
+        let end = (end_f as usize).min(num_bins);
+        // Ensure non-empty bands: merge into previous if empty
+        if start < end {
+            bounds.push((start, end));
+        } else if !bounds.is_empty() {
+            // Extend previous band to cover this range
+            let last = bounds.last_mut().unwrap();
+            last.1 = end.max(last.1);
+        }
+    }
+    bounds
 }
 
 /// The fingerprinting engine.
@@ -196,7 +252,8 @@ impl Fingerprinter {
         let mut ring_start: usize = 0; // absolute frame of ring[0]
         let mut peaks: Vec<Peak> = Vec::new();
 
-        let band_size = num_bins / self.config.num_bands;
+        let bands =
+            band_boundaries(num_bins, self.config.num_bands, self.config.log_frequency_bands);
 
         // Pre-fill: compute frames [0, min(ring_cap, total_frames))
         let prefill = ring_cap.min(total_frames);
@@ -208,6 +265,28 @@ impl Fingerprinter {
             ring.push_back(mags);
         }
         // ring now holds frames [0..prefill), ring_start = 0
+
+        // Pre-compute per-band adaptive thresholds from the pre-fill frames (squared).
+        // Uses mean energy across pre-fill frames, scaled by 2× (in squared domain: 4×).
+        let band_thresholds_sq: Vec<f32> = if self.config.adaptive_threshold && !ring.is_empty() {
+            bands
+                .iter()
+                .map(|&(bin_start, bin_end)| {
+                    let band_width = (bin_end - bin_start).max(1) as f32;
+                    let mean_energy: f32 = ring
+                        .iter()
+                        .map(|frame| {
+                            frame[bin_start..bin_end].iter().sum::<f32>() / band_width
+                        })
+                        .sum::<f32>()
+                        / ring.len() as f32;
+                    // 2× mean energy in squared domain = 4× in linear domain
+                    (mean_energy * 2.0).max(threshold_sq)
+                })
+                .collect()
+        } else {
+            vec![threshold_sq; bands.len()]
+        };
 
         for center_frame in 0..total_frames {
             // The neighbourhood in absolute frame indices
@@ -233,14 +312,13 @@ impl Fingerprinter {
             // center_frame's data is at ring index (center_frame - ring_start)
             let center_idx = center_frame - ring_start;
 
-            for band in 0..self.config.num_bands {
-                let bin_start = band * band_size;
-                let bin_end = ((band + 1) * band_size).min(num_bins);
+            for (band_idx, &(bin_start, bin_end)) in bands.iter().enumerate() {
+                let band_threshold = band_thresholds_sq[band_idx];
                 let mut band_peaks: Vec<Peak> = Vec::new();
 
                 for bin in bin_start..bin_end {
                     let mag = ring[center_idx][bin];
-                    if mag < threshold_sq {
+                    if mag < band_threshold {
                         continue;
                     }
 
@@ -299,24 +377,50 @@ impl Fingerprinter {
     fn find_peaks(&self, spectrogram: &Spectrogram) -> Vec<Peak> {
         let num_bins = spectrogram.num_bins;
         let num_frames = spectrogram.num_frames;
-        let band_size = num_bins / self.config.num_bands;
+        let bands =
+            band_boundaries(num_bins, self.config.num_bands, self.config.log_frequency_bands);
+
+        // Pre-compute per-band adaptive thresholds if enabled.
+        // Uses the mean energy across all frames in the band, then scales up.
+        // This adapts to recording volume while keeping the threshold below peaks.
+        let band_thresholds: Vec<f32> = if self.config.adaptive_threshold {
+            bands
+                .iter()
+                .map(|&(bin_start, bin_end)| {
+                    let band_width = (bin_end - bin_start).max(1) as f32;
+                    let mean_energy: f32 = (0..num_frames)
+                        .map(|f| {
+                            let frame = spectrogram.frame(f);
+                            frame[bin_start..bin_end].iter().sum::<f32>() / band_width
+                        })
+                        .sum::<f32>()
+                        / num_frames as f32;
+                    // Threshold at 2× mean energy, floored at absolute minimum
+                    (mean_energy * 2.0).max(self.config.peak_threshold)
+                })
+                .collect()
+        } else {
+            vec![self.config.peak_threshold; bands.len()]
+        };
 
         let mut all_peaks = Vec::new();
 
         for frame in 0..num_frames {
+            // Skip noise-dominated frames (spectral flatness > 0.8).
+            if spectrogram.spectral_flatness(frame) > 0.8 {
+                continue;
+            }
+
             let mags = spectrogram.frame(frame);
 
-            for band in 0..self.config.num_bands {
-                let bin_start = band * band_size;
-                let bin_end = ((band + 1) * band_size).min(num_bins);
-
-                // Find local maxima within this band
+            for (band_idx, &(bin_start, bin_end)) in bands.iter().enumerate() {
+                let threshold = band_thresholds[band_idx];
                 let mut band_peaks: Vec<Peak> = Vec::new();
 
                 #[allow(clippy::needless_range_loop)]
                 for bin in bin_start..bin_end {
                     let mag = mags[bin];
-                    if mag < self.config.peak_threshold {
+                    if mag < threshold {
                         continue;
                     }
 

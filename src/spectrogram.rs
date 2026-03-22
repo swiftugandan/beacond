@@ -131,6 +131,28 @@ impl Spectrogram {
     pub fn frame_to_time(&self, frame: usize) -> f32 {
         frame as f32 * self.hop_size as f32 / self.sample_rate as f32
     }
+
+    /// Compute spectral flatness for a frame.
+    ///
+    /// Spectral flatness = geometric_mean / arithmetic_mean of the magnitude spectrum.
+    /// Returns a value in [0, 1]: 0 = tonal (peaked), 1 = white noise (flat).
+    /// Frames with flatness > threshold can be skipped during peak extraction
+    /// to avoid extracting noise-derived peaks.
+    pub fn spectral_flatness(&self, frame: usize) -> f32 {
+        let mags = self.frame(frame);
+        let n = mags.len() as f32;
+        if n == 0.0 {
+            return 1.0;
+        }
+        let arith_mean = mags.iter().sum::<f32>() / n;
+        if arith_mean <= 0.0 {
+            return 1.0; // silence → treat as noise
+        }
+        // Geometric mean via exp(mean(ln(x))). Add epsilon to avoid ln(0).
+        let log_sum: f32 = mags.iter().map(|&m| (m + 1e-10).ln()).sum();
+        let geo_mean = (log_sum / n).exp();
+        (geo_mean / arith_mean).clamp(0.0, 1.0)
+    }
 }
 
 /// Compute a single frame's magnitude spectrum into an output buffer.
