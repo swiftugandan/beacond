@@ -7,7 +7,7 @@
 //! 4. Each hash encodes: (freq1, freq2, time_delta) → anchor_time
 
 use crate::spectrogram::{
-    compute_frame_magnitudes, frame_count, hann_window, Spectrogram, SpectrogramConfig,
+    compute_frame_magnitudes_squared, frame_count, hann_window, Spectrogram, SpectrogramConfig,
 };
 use rustfft::{num_complex::Complex, FftPlanner};
 use serde::{Deserialize, Serialize};
@@ -183,6 +183,10 @@ impl Fingerprinter {
         let fft = planner.plan_fft_forward(window_size);
         let mut fft_buffer = vec![Complex::new(0.0f32, 0.0f32); window_size];
 
+        // Use squared magnitudes throughout — avoids sqrt per bin.
+        // The threshold must also be squared for consistent comparison.
+        let threshold_sq = self.config.peak_threshold * self.config.peak_threshold;
+
         // Rolling buffer: stores up to (2*PEAK_NEIGHBOURHOOD_TIME + 1) frames.
         // ring_start tracks which absolute frame index ring[0] corresponds to.
         let ring_cap = PEAK_NEIGHBOURHOOD_TIME * 2 + 1;
@@ -196,7 +200,7 @@ impl Fingerprinter {
         let prefill = ring_cap.min(total_frames);
         for f in 0..prefill {
             let mut mags = vec![0.0f32; num_bins];
-            compute_frame_magnitudes(
+            compute_frame_magnitudes_squared(
                 samples, f, hop_size, &hann_win, fft.as_ref(), &mut fft_buffer, &mut mags,
             );
             ring.push(mags);
@@ -218,7 +222,7 @@ impl Fingerprinter {
             let ring_end = ring_start + ring.len(); // exclusive absolute frame
             for f in ring_end..t_end {
                 let mut mags = vec![0.0f32; num_bins];
-                compute_frame_magnitudes(
+                compute_frame_magnitudes_squared(
                     samples, f, hop_size, &hann_win, fft.as_ref(), &mut fft_buffer, &mut mags,
                 );
                 ring.push(mags);
@@ -234,7 +238,7 @@ impl Fingerprinter {
 
                 for bin in bin_start..bin_end {
                     let mag = ring[center_idx][bin];
-                    if mag < self.config.peak_threshold {
+                    if mag < threshold_sq {
                         continue;
                     }
 
@@ -265,8 +269,13 @@ impl Fingerprinter {
                     }
                 }
 
-                band_peaks.sort_by(|a, b| b.magnitude.partial_cmp(&a.magnitude).unwrap());
-                band_peaks.truncate(self.config.max_peaks_per_band);
+                let max = self.config.max_peaks_per_band;
+                if band_peaks.len() > max {
+                    band_peaks.select_nth_unstable_by(max - 1, |a, b| {
+                        b.magnitude.partial_cmp(&a.magnitude).unwrap()
+                    });
+                    band_peaks.truncate(max);
+                }
                 peaks.extend(band_peaks);
             }
         }
@@ -319,9 +328,14 @@ impl Fingerprinter {
                     }
                 }
 
-                // Keep only top N peaks per band
-                band_peaks.sort_by(|a, b| b.magnitude.partial_cmp(&a.magnitude).unwrap());
-                band_peaks.truncate(self.config.max_peaks_per_band);
+                // Keep only top N peaks per band using O(n) partial sort
+                let max = self.config.max_peaks_per_band;
+                if band_peaks.len() > max {
+                    band_peaks.select_nth_unstable_by(max - 1, |a, b| {
+                        b.magnitude.partial_cmp(&a.magnitude).unwrap()
+                    });
+                    band_peaks.truncate(max);
+                }
                 all_peaks.extend(band_peaks);
             }
         }

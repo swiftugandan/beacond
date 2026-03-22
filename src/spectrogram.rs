@@ -144,6 +144,33 @@ pub fn compute_frame_magnitudes(
     fft_buffer: &mut [Complex<f32>],
     out: &mut [f32],
 ) {
+    compute_frame_impl(samples, frame_idx, hop_size, hann_win, fft, fft_buffer, out, false);
+}
+
+/// Like `compute_frame_magnitudes` but stores squared magnitudes (skips sqrt).
+/// Use this when only relative ordering matters (e.g. peak detection).
+pub fn compute_frame_magnitudes_squared(
+    samples: &[f32],
+    frame_idx: usize,
+    hop_size: usize,
+    hann_win: &[f32],
+    fft: &dyn rustfft::Fft<f32>,
+    fft_buffer: &mut [Complex<f32>],
+    out: &mut [f32],
+) {
+    compute_frame_impl(samples, frame_idx, hop_size, hann_win, fft, fft_buffer, out, true);
+}
+
+fn compute_frame_impl(
+    samples: &[f32],
+    frame_idx: usize,
+    hop_size: usize,
+    hann_win: &[f32],
+    fft: &dyn rustfft::Fft<f32>,
+    fft_buffer: &mut [Complex<f32>],
+    out: &mut [f32],
+    squared: bool,
+) {
     let window_size = hann_win.len();
     let start = frame_idx * hop_size;
     let end = (start + window_size).min(samples.len());
@@ -160,8 +187,14 @@ pub fn compute_frame_magnitudes(
     fft.process(fft_buffer);
 
     let num_bins = out.len();
-    for (o, c) in out.iter_mut().zip(fft_buffer[..num_bins].iter()) {
-        *o = (c.re * c.re + c.im * c.im).sqrt();
+    if squared {
+        for (o, c) in out.iter_mut().zip(fft_buffer[..num_bins].iter()) {
+            *o = c.re * c.re + c.im * c.im;
+        }
+    } else {
+        for (o, c) in out.iter_mut().zip(fft_buffer[..num_bins].iter()) {
+            *o = (c.re * c.re + c.im * c.im).sqrt();
+        }
     }
 }
 

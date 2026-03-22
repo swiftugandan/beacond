@@ -68,10 +68,10 @@ impl BloomFilter {
     /// Derive a bit index from the original hash and a hash-function index.
     /// Uses xxh3 with different seeds to produce independent bit positions.
     fn bit_index(&self, hash: u64, k: u32) -> usize {
-        let derived = xxh3_64(&[
-            hash.to_le_bytes().as_slice(),
-            &k.to_le_bytes(),
-        ].concat());
+        let mut buf = [0u8; 12];
+        buf[0..8].copy_from_slice(&hash.to_le_bytes());
+        buf[8..12].copy_from_slice(&k.to_le_bytes());
+        let derived = xxh3_64(&buf);
         (derived as usize) % self.num_bits
     }
 }

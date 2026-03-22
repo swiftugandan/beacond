@@ -240,17 +240,25 @@ fn biquad_lowpass_inplace(samples: &mut [f32], sample_rate: u32, cutoff: f32) {
 }
 
 /// Apply a biquad filter with the given coefficients, mutating samples in-place.
+/// Coefficients are computed in f64 for precision, then cast to f32 for the
+/// inner loop to enable SIMD auto-vectorization and halve memory bandwidth.
 fn apply_biquad_inplace(samples: &mut [f32], b0: f64, b1: f64, b2: f64, a1: f64, a2: f64) {
-    let mut x1: f64 = 0.0;
-    let mut x2: f64 = 0.0;
-    let mut y1: f64 = 0.0;
-    let mut y2: f64 = 0.0;
+    let b0 = b0 as f32;
+    let b1 = b1 as f32;
+    let b2 = b2 as f32;
+    let a1 = a1 as f32;
+    let a2 = a2 as f32;
+
+    let mut x1: f32 = 0.0;
+    let mut x2: f32 = 0.0;
+    let mut y1: f32 = 0.0;
+    let mut y2: f32 = 0.0;
 
     for sample in samples.iter_mut() {
-        let x0 = *sample as f64;
+        let x0 = *sample;
         let y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
 
-        *sample = y0 as f32;
+        *sample = y0;
 
         x2 = x1;
         x1 = x0;

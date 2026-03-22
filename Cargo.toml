@@ -27,3 +27,8 @@ anyhow = "1"
 thiserror = "1"
 byteorder = "1"
 cpal = "0.15"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
